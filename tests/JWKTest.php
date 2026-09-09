@@ -252,6 +252,151 @@ class JWKTest extends TestCase
         $keys = JWK::parseKeySet(['keys' => [$badJwk]]);
     }
 
+    public function testParseAkpJwk()
+    {
+        $jwk = self::getAkpJwk('ML-DSA-44');
+
+        $key = JWK::parseKey($jwk);
+
+        $this->assertNotNull($key);
+        $this->assertSame('ML-DSA-44', $key->getAlgorithm());
+        // The key material is the public key in standard base64, as for OKP keys
+        $this->assertSame(
+            JWT::urlsafeB64Decode($jwk['pub']),
+            base64_decode($key->getKeyMaterial())
+        );
+        $this->assertSame(1312, \strlen(base64_decode($key->getKeyMaterial())));
+    }
+
+    public function testParseAkpJwkKeySet()
+    {
+        $jwkSet = json_decode(
+            file_get_contents(__DIR__ . '/data/ml-dsa-jwkset.json'),
+            true
+        );
+
+        $keys = JWK::parseKeySet($jwkSet);
+
+        $this->assertCount(3, $keys);
+        foreach ($jwkSet['keys'] as $jwk) {
+            $this->assertArrayHasKey($jwk['kid'], $keys);
+            $this->assertSame($jwk['alg'], $keys[$jwk['kid']]->getAlgorithm());
+        }
+    }
+
+    public function testParseAkpJwkWithPrivateKey()
+    {
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage('Key data must be for a public key');
+
+        $jwk = self::getAkpJwk('ML-DSA-44');
+        // RFC 9964 defines "priv" as the private key seed, which must not be present
+        // in a public key
+        $jwk['priv'] = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+
+        JWK::parseKey($jwk);
+    }
+
+    public function testParseAkpJwkMissingPub()
+    {
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage('pub not set');
+
+        $jwk = self::getAkpJwk('ML-DSA-44');
+        unset($jwk['pub']);
+
+        JWK::parseKey($jwk);
+    }
+
+    public function testParseAkpJwkMissingAlgIsNotDefaulted()
+    {
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage('AKP keys must contain an "alg" parameter');
+
+        $jwk = self::getAkpJwk('ML-DSA-44');
+        unset($jwk['alg']);
+
+        // An AKP key's "alg" determines its parameter set, so unlike other key types
+        // it is not defaulted
+        JWK::parseKey($jwk, 'ML-DSA-44');
+    }
+
+    public function testParseAkpJwkWithUnsupportedMlDsaParameterSet()
+    {
+        $this->expectException(DomainException::class);
+        $this->expectExceptionMessage('Unrecognised or unsupported ML-DSA parameter set');
+
+        $jwk = self::getAkpJwk('ML-DSA-44');
+        $jwk['alg'] = 'ML-DSA-99';
+
+        JWK::parseKey($jwk);
+    }
+
+    public function testParseAkpJwkWithUnsupportedAlgorithmIsSkipped()
+    {
+        $jwkSet = json_decode(
+            file_get_contents(__DIR__ . '/data/rsa-jwkset.json'),
+            true
+        );
+        // The AKP key type is not limited to the algorithms registered by RFC 9964, so
+        // an unknown one must not invalidate the rest of the key set
+        $jwkSet['keys'][] = [
+            'kid' => 'unsupported-akp-alg',
+            'kty' => 'AKP',
+            'alg' => 'SLH-DSA-SHA2-128s',
+            'pub' => 'ZmFrZQ',
+        ];
+
+        $keys = JWK::parseKeySet($jwkSet);
+
+        $this->assertArrayHasKey('jwk1', $keys);
+        $this->assertArrayNotHasKey('unsupported-akp-alg', $keys);
+    }
+
+    public function testParseAkpJwkWithWrongLengthPub()
+    {
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage('AKP public key for ML-DSA-44 must be 1312 bytes, 1311 bytes given');
+
+        $jwk = self::getAkpJwk('ML-DSA-44');
+        $jwk['pub'] = JWT::urlsafeB64Encode(
+            substr(JWT::urlsafeB64Decode($jwk['pub']), 0, -1)
+        );
+
+        JWK::parseKey($jwk);
+    }
+
+    public function testParseAkpJwkWithMismatchedParameterSet()
+    {
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage('AKP public key for ML-DSA-65 must be 1952 bytes, 1312 bytes given');
+
+        // An ML-DSA-44 public key labelled as ML-DSA-65
+        $jwk = self::getAkpJwk('ML-DSA-44');
+        $jwk['alg'] = 'ML-DSA-65';
+
+        JWK::parseKey($jwk);
+    }
+
+    /**
+     * @return array<string, string> The RFC 9964 AKP JWK for the given algorithm
+     */
+    private static function getAkpJwk(string $alg): array
+    {
+        $jwkSet = json_decode(
+            file_get_contents(__DIR__ . '/data/ml-dsa-jwkset.json'),
+            true
+        );
+
+        foreach ($jwkSet['keys'] as $jwk) {
+            if ($jwk['alg'] === $alg) {
+                return $jwk;
+            }
+        }
+
+        throw new \RuntimeException('No AKP JWK for ' . $alg);
+    }
+
     public function testParseKey()
     {
         // Use a known module and exponent, and ensure it parses as expected

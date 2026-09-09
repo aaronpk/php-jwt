@@ -34,6 +34,27 @@ class JWT
     private const RSA_KEY_MIN_LENGTH = 2048;
 
     /**
+     * The ML-DSA parameter sets registered for JOSE, keyed by "alg" value. The
+     * public key and signature sizes are defined in RFC 9964, Section 5. The
+     * "expanded" size is only used to produce a helpful error message: RFC 9964,
+     * Section 4 defines the private key as the 32 byte seed exclusively.
+     *
+     * @see https://www.rfc-editor.org/rfc/rfc9964#section-5
+     */
+    private const ML_DSA_PARAMS = [
+        'ML-DSA-44' => ['pub' => 1312, 'sig' => 2420, 'expanded' => 2560],
+        'ML-DSA-65' => ['pub' => 1952, 'sig' => 3309, 'expanded' => 4032],
+        'ML-DSA-87' => ['pub' => 2592, 'sig' => 4627, 'expanded' => 4896],
+    ];
+
+    /**
+     * The length of an ML-DSA private key seed in bytes.
+     *
+     * @see https://www.rfc-editor.org/rfc/rfc9964#section-4
+     */
+    private const ML_DSA_SEED_LENGTH = 32;
+
+    /**
      * When checking nbf, iat or expiration times,
      * we want to provide some extra leeway time to
      * account for clock skew.
@@ -65,7 +86,10 @@ class JWT
         'RS384' => ['openssl', 'SHA384'],
         'RS512' => ['openssl', 'SHA512'],
         'PS256' => ['openssl', 'SHA256'],
-        'EdDSA' => ['sodium_crypto', 'EdDSA']
+        'EdDSA' => ['sodium_crypto', 'EdDSA'],
+        'ML-DSA-44' => ['ml_dsa', 'ML-DSA-44'],
+        'ML-DSA-65' => ['ml_dsa', 'ML-DSA-65'],
+        'ML-DSA-87' => ['ml_dsa', 'ML-DSA-87']
     ];
 
     /**
@@ -79,8 +103,9 @@ class JWT
      *                                                                      Each Key object contains an algorithm and
      *                                                                      matching key.
      *                                                                      Supported algorithms are 'ES384','ES256',
-     *                                                                      'HS256', 'HS384', 'HS512', 'RS256', 'RS384'
-     *                                                                      and 'RS512'.
+     *                                                                      'HS256', 'HS384', 'HS512', 'RS256', 'RS384',
+     *                                                                      'RS512', 'ML-DSA-44', 'ML-DSA-65' and
+     *                                                                      'ML-DSA-87'.
      * @param stdClass               $headers                               Optional. Populates stdClass with headers.
      *
      * @return stdClass The JWT's payload as a PHP object
@@ -201,7 +226,8 @@ class JWT
      * @param array<mixed>          $payload PHP array
      * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate $key The secret key.
      * @param string                $alg     Supported algorithms are 'ES384','ES256', 'ES256K', 'HS256',
-     *                                       'HS384', 'HS512', 'RS256', 'RS384', and 'RS512'
+     *                                       'HS384', 'HS512', 'RS256', 'RS384', 'RS512', 'ML-DSA-44',
+     *                                       'ML-DSA-65' and 'ML-DSA-87'
      * @param string                $keyId
      * @param array<string, string|string[]> $head  An array with header elements to attach
      *
@@ -251,7 +277,8 @@ class JWT
      * @param string $msg  The message to sign
      * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate  $key  The secret key.
      * @param string $alg  Supported algorithms are 'EdDSA', 'ES384', 'ES256', 'ES256K', 'HS256',
-     *                    'HS384', 'HS512', 'RS256', 'RS384', 'PS256' and 'RS512'
+     *                    'HS384', 'HS512', 'RS256', 'RS384', 'PS256', 'RS512', 'ML-DSA-44',
+     *                    'ML-DSA-65' and 'ML-DSA-87'
      *
      * @return string An encrypted message
      *
@@ -302,6 +329,8 @@ class JWT
                 } catch (Exception $e) {
                     throw new DomainException($e->getMessage(), 0, $e);
                 }
+            case 'ml_dsa':
+                return self::signMlDsa($key, $msg, $alg);
         }
 
         throw new DomainException('Algorithm not supported');
@@ -365,6 +394,11 @@ class JWT
                 } catch (Exception $e) {
                     throw new DomainException($e->getMessage(), 0, $e);
                 }
+            case 'ml_dsa':
+                // This case must stay above 'hash_hmac', which doubles as the
+                // switch's default: an ML-DSA token would otherwise be handed to
+                // hash_hmac() instead of being verified with ML-DSA.
+                return self::verifyMlDsa($keyMaterial, $msg, $signature, $alg);
             case 'hash_hmac':
             default:
                 if (!\is_string($keyMaterial)) {
@@ -829,5 +863,199 @@ class JWT
         return $rsa->withPadding(\phpseclib3\Crypt\RSA::SIGNATURE_PSS)
             ->withHash('sha256')
             ->verify($message, $signature);
+    }
+
+    /**
+     * Signs a message with an ML-DSA algorithm, as defined in RFC 9964.
+     *
+     * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate $key The 32 byte ML-DSA
+     *                                                            private key seed
+     * @param string $message
+     * @param string $alg One of 'ML-DSA-44', 'ML-DSA-65' or 'ML-DSA-87'
+     *
+     * @throws DomainException Missing dependency, or provided key is invalid
+     */
+    private static function signMlDsa(
+        #[\SensitiveParameter] $key,
+        string $message,
+        string $alg
+    ): string {
+        if (!isset(self::ML_DSA_PARAMS[$alg])) {
+            throw new DomainException('Algorithm not supported');
+        }
+
+        $seed = self::validateMlDsaSigningKey($key, $alg);
+
+        try {
+            // The seed is expanded into a signing key rather than passed to sign()
+            // as a raw string, because a raw string means the seed to the pure PHP
+            // implementation but an already expanded private key to ext-pqcrypto.
+            // Deriving the key pair first is correct either way.
+            switch ($alg) {
+                case 'ML-DSA-44':
+                    $keyPair = \ParagonIE\PQCrypto\Compat::mldsa44_seed_keypair($seed);
+                    return \ParagonIE\PQCrypto\Compat::mldsa44_sign($keyPair['signingKey'], $message)->bytes();
+                case 'ML-DSA-65':
+                    $keyPair = \ParagonIE\PQCrypto\Compat::mldsa65_seed_keypair($seed);
+                    return \ParagonIE\PQCrypto\Compat::mldsa65_sign($keyPair['signingKey'], $message)->bytes();
+                case 'ML-DSA-87':
+                default:
+                    $keyPair = \ParagonIE\PQCrypto\Compat::mldsa87_seed_keypair($seed);
+                    return \ParagonIE\PQCrypto\Compat::mldsa87_sign($keyPair['signingKey'], $message)->bytes();
+            }
+        } catch (Exception $e) {
+            throw new DomainException($e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * Validates an ML-DSA signature, as defined in RFC 9964.
+     *
+     * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate $keyMaterial The ML-DSA
+     *                                                                   public key
+     * @param string $message
+     * @param string $signature
+     * @param string $alg One of 'ML-DSA-44', 'ML-DSA-65' or 'ML-DSA-87'
+     *
+     * @throws DomainException Missing dependency, or provided key is invalid
+     */
+    private static function verifyMlDsa(
+        #[\SensitiveParameter] $keyMaterial,
+        string $message,
+        string $signature,
+        string $alg
+    ): bool {
+        if (!isset(self::ML_DSA_PARAMS[$alg])) {
+            throw new DomainException('Algorithm not supported');
+        }
+
+        $publicKey = self::validateMlDsaVerificationKey($keyMaterial, $alg);
+
+        // The signature is attacker controlled, so an unexpected length is a failed
+        // verification rather than an error.
+        if (self::safeStrlen($signature) !== self::ML_DSA_PARAMS[$alg]['sig']) {
+            return false;
+        }
+
+        try {
+            switch ($alg) {
+                case 'ML-DSA-44':
+                    return \ParagonIE\PQCrypto\Compat::mldsa44_verify($publicKey, $signature, $message);
+                case 'ML-DSA-65':
+                    return \ParagonIE\PQCrypto\Compat::mldsa65_verify($publicKey, $signature, $message);
+                case 'ML-DSA-87':
+                default:
+                    return \ParagonIE\PQCrypto\Compat::mldsa87_verify($publicKey, $signature, $message);
+            }
+        } catch (Exception $e) {
+            throw new DomainException($e->getMessage(), 0, $e);
+        }
+    }
+
+    /**
+     * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate $keyMaterial
+     * @param string $alg One of 'ML-DSA-44', 'ML-DSA-65' or 'ML-DSA-87'
+     *
+     * @return string The 32 byte ML-DSA private key seed
+     */
+    private static function validateMlDsaSigningKey(
+        #[\SensitiveParameter] $keyMaterial,
+        string $alg
+    ): string {
+        $key = self::decodeMlDsaKey($keyMaterial, $alg, self::ML_DSA_SEED_LENGTH);
+        $length = self::safeStrlen($key);
+        if ($length === self::ML_DSA_SEED_LENGTH) {
+            return $key;
+        }
+        if ($length === self::ML_DSA_PARAMS[$alg]['pub']) {
+            throw new DomainException(\sprintf(
+                '%s public key provided where a private key is required',
+                $alg
+            ));
+        }
+        if ($length === self::ML_DSA_PARAMS[$alg]['expanded']) {
+            // RFC 9964, Section 4 supports the seed format exclusively.
+            throw new DomainException(\sprintf(
+                '%s expanded private keys are not supported, provide the %d byte seed instead',
+                $alg,
+                self::ML_DSA_SEED_LENGTH
+            ));
+        }
+        throw new DomainException(\sprintf(
+            '%s private key must be a %d byte seed, %d bytes given',
+            $alg,
+            self::ML_DSA_SEED_LENGTH,
+            $length
+        ));
+    }
+
+    /**
+     * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate $keyMaterial
+     * @param string $alg One of 'ML-DSA-44', 'ML-DSA-65' or 'ML-DSA-87'
+     *
+     * @return string The raw ML-DSA public key
+     */
+    private static function validateMlDsaVerificationKey(
+        #[\SensitiveParameter] $keyMaterial,
+        string $alg
+    ): string {
+        $expectedLength = self::ML_DSA_PARAMS[$alg]['pub'];
+        $key = self::decodeMlDsaKey($keyMaterial, $alg, $expectedLength);
+        $length = self::safeStrlen($key);
+        if ($length === $expectedLength) {
+            return $key;
+        }
+        if ($length === self::ML_DSA_SEED_LENGTH) {
+            throw new DomainException(\sprintf(
+                '%s private key provided where a public key is required',
+                $alg
+            ));
+        }
+        throw new DomainException(\sprintf(
+            '%s public key must be %d bytes, %d bytes given',
+            $alg,
+            $expectedLength,
+            $length
+        ));
+    }
+
+    /**
+     * Decodes ML-DSA key material. Like EdDSA keys, ML-DSA keys are provided as
+     * base64 or base64url encoded text, which is what RFC 9964 uses for the "pub"
+     * and "priv" JWK parameters, and the last non-empty line is used.
+     *
+     * @param string|OpenSSLAsymmetricKey|OpenSSLCertificate $keyMaterial
+     * @param string $alg One of 'ML-DSA-44', 'ML-DSA-65' or 'ML-DSA-87'
+     * @param int $expectedLength The length the decoded key is expected to have
+     *
+     * @return string The decoded key, which the caller must check the length of
+     */
+    private static function decodeMlDsaKey(
+        #[\SensitiveParameter] $keyMaterial,
+        string $alg,
+        int $expectedLength
+    ): string {
+        if (!class_exists('\ParagonIE\PQCrypto\Compat')) {
+            throw new DomainException('paragonie/pqcrypto_compat is required for ML-DSA support');
+        }
+        if (!\is_string($keyMaterial)) {
+            throw new InvalidArgumentException(\sprintf('key must be a string when using %s', $alg));
+        }
+        // The last non-empty line is used as the key.
+        $lines = array_filter(explode("\n", $keyMaterial));
+        $key = self::urlsafeB64Decode((string) end($lines));
+        if (self::safeStrlen($key) === $expectedLength) {
+            return $key;
+        }
+        // Raw key bytes are accepted too. Decoding is attempted first, so encoded
+        // keys always win, and no valid ML-DSA key length is also the length of
+        // another valid key's base64 encoding, so this is unambiguous.
+        if (self::safeStrlen($keyMaterial) === $expectedLength) {
+            return $keyMaterial;
+        }
+        if (self::safeStrlen($key) === 0) {
+            throw new DomainException('Key cannot be empty string');
+        }
+        return $key;
     }
 }

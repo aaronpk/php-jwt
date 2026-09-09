@@ -311,6 +311,63 @@ $decoded = JWT::decode($jwt, new Key($publicKey, 'PS256'));
 echo "Decode:\n" . print_r((array) $decoded, true) . "\n";
 ```
 
+## Example with ML-DSA (RFC 9964)
+
+### Note
+PHP has no built-in support for ML-DSA, the post-quantum signature scheme standardized in
+[FIPS 204](https://csrc.nist.gov/pubs/fips/204/final), so we provide support via a soft dependency on the
+[paragonie/pqcrypto_compat](https://github.com/paragonie/pqcrypto_compat) library. It is necessary to install this
+library in your project if you plan to use `ML-DSA-44`, `ML-DSA-65` or `ML-DSA-87`.
+```bash
+composer install paragonie/pqcrypto_compat:^0.3
+```
+That library is a pure PHP implementation, which is slower than the other algorithms this library supports. It will
+automatically use the [ext-pqcrypto](https://github.com/paragonie/ext-pqcrypto) extension instead if it is installed.
+
+ML-DSA public keys and signatures are considerably larger than those of the other supported algorithms: an
+`ML-DSA-87` public key is 2592 bytes and its signatures are 4627 bytes, so tokens are several kilobytes long.
+
+```php
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
+
+// Public and private keys are expected to be Base64 or Base64URL encoded, as they are
+// in a JWK, and the last non-empty line is used. Raw key bytes are also accepted.
+//
+// As required by RFC 9964, the private key is the 32 byte seed. The expanded private key
+// format defined by FIPS 204 is not supported.
+$privateKey = '...'; // Base64URL encoded 32 byte seed
+$publicKey = '...';  // Base64URL encoded 1312 byte ML-DSA-44 public key
+
+$payload = [
+    'iss' => 'example.org',
+    'aud' => 'example.com',
+    'iat' => 1356999524,
+    'nbf' => 1357000000
+];
+
+/**
+* ML-DSA support requires paragonie/pqcrypto_compat
+*/
+$jwt = JWT::encode($payload, $privateKey, 'ML-DSA-44', 'keyid');
+echo "Encode:\n" . print_r($jwt, true) . "\n";
+
+$decoded = JWT::decode($jwt, new Key($publicKey, 'ML-DSA-44'));
+echo "Decode:\n" . print_r((array) $decoded, true) . "\n";
+```
+
+ML-DSA public keys are published as JWKs with a `kty` of `AKP` (Algorithm Key Pair), where `alg` identifies the
+parameter set and `pub` holds the public key. `JWK::parseKey()` and `JWK::parseKeySet()` accept these:
+
+```json
+{
+    "kid": "T4xl70S7MT6Zeq6r9V9fPJGVn76wfnXJ21-gyo0Gu6o",
+    "kty": "AKP",
+    "alg": "ML-DSA-44",
+    "pub": "unH59k4Ruut..."
+}
+```
+
 ## Using JWKs
 
 ```php
@@ -389,7 +446,8 @@ try {
     // provided algorithm is unsupported OR
     // provided key is invalid OR
     // unknown error thrown in openSSL or libsodium OR
-    // libsodium is required but not available.
+    // libsodium is required but not available OR
+    // paragonie/pqcrypto_compat is required but not installed.
 } catch (SignatureInvalidException $e) {
     // provided JWT signature verification failed.
 } catch (BeforeValidException $e) {

@@ -46,6 +46,16 @@ class JWK
         'Ed25519' => true, // RFC 8037
     ];
 
+    // For keys with "kty" equal to "AKP" (Algorithm Key Pair), the "alg" parameter identifies the
+    // algorithm and its parameter set, which in turn determines the length of the "pub" parameter.
+    // This library supports the following algorithms, mapped to their public key length in bytes
+    // (these lengths are also defined in Firebase\JWT\JWT):
+    private const AKP_ALGORITHMS = [
+        'ML-DSA-44' => 1312, // RFC 9964
+        'ML-DSA-65' => 1952, // RFC 9964
+        'ML-DSA-87' => 2592, // RFC 9964
+    ];
+
     /**
      * Parse a set of JWK keys
      *
@@ -112,6 +122,7 @@ class JWK
             throw new UnexpectedValueException('JWK must contain a "kty" parameter');
         }
 
+        $algProvided = isset($jwk['alg']);
         if (!isset($jwk['alg'])) {
             if (\is_null($defaultAlg)) {
                 // The "alg" parameter is optional in a KTY, but an algorithm is required
@@ -183,6 +194,46 @@ class JWK
 
                 // This library works internally with EdDSA keys (Ed25519) encoded in standard base64.
                 $publicKey = JWT::convertBase64urlToBase64($jwk['x']);
+                return new Key($publicKey, $jwk['alg']);
+            case 'AKP':
+                if (!$algProvided) {
+                    // Unlike other key types, an AKP key's "alg" identifies the algorithm and its
+                    // parameter set, so it cannot be defaulted from elsewhere in the key set.
+                    // @see https://www.rfc-editor.org/rfc/rfc9964#section-3
+                    throw new UnexpectedValueException('AKP keys must contain an "alg" parameter');
+                }
+
+                if (isset($jwk['priv'])) {
+                    // The key is actually a private key
+                    throw new UnexpectedValueException('Key data must be for a public key');
+                }
+
+                if (!isset(self::AKP_ALGORITHMS[$jwk['alg']])) {
+                    if (\str_starts_with((string) $jwk['alg'], 'ML-DSA')) {
+                        throw new DomainException('Unrecognised or unsupported ML-DSA parameter set');
+                    }
+                    // The AKP key type is deliberately not limited to the algorithms registered by
+                    // RFC 9964, so skip algorithms this library does not know rather than
+                    // invalidating the rest of the key set.
+                    return null;
+                }
+
+                if (empty($jwk['pub'])) {
+                    throw new UnexpectedValueException('pub not set');
+                }
+
+                $publicKeyLength = \strlen(JWT::urlsafeB64Decode($jwk['pub']));
+                if ($publicKeyLength !== self::AKP_ALGORITHMS[$jwk['alg']]) {
+                    throw new UnexpectedValueException(\sprintf(
+                        'AKP public key for %s must be %d bytes, %d bytes given',
+                        $jwk['alg'],
+                        self::AKP_ALGORITHMS[$jwk['alg']],
+                        $publicKeyLength
+                    ));
+                }
+
+                // This library works internally with ML-DSA keys encoded in standard base64.
+                $publicKey = JWT::convertBase64urlToBase64($jwk['pub']);
                 return new Key($publicKey, $jwk['alg']);
             case 'oct':
                 if (!isset($jwk['k'])) {

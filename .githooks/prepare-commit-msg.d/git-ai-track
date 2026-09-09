@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+# okta-ai-attribution v0.0.1
+import json
+import os
+import subprocess
+import sys
+
+COAUTHORS = {
+    "claude":  {"value": "Claude <noreply@anthropic.com>",  "match": "noreply@anthropic.com"},
+    "copilot": {"value": "Copilot <copilot@github.com>",    "match": "copilot"},
+}
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(0)
+
+    commit_msg_file = sys.argv[1]
+    commit_source = sys.argv[2] if len(sys.argv) > 2 else ""
+
+    # Skip merge commits, squash merges, and amend/cherry-pick-with-edit (-c/-C) sources
+    if commit_source in ("merge", "squash", "commit"):
+        sys.exit(0)
+
+    try:
+        git_dir = subprocess.check_output(
+            ["git", "rev-parse", "--git-dir"],
+            text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except subprocess.CalledProcessError:
+        sys.exit(0)
+
+    state_file = os.path.join(git_dir, "git-ai-working-state.json")
+    if not os.path.exists(state_file):
+        sys.exit(0)
+
+    try:
+        with open(state_file) as f:
+            state = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        sys.exit(0)
+
+    sessions = state.get("sessions", {})
+    tools = sorted(set(
+        s.get("tool") for s in sessions.values() if s.get("files") and s.get("tool")
+    ))
+    if not tools:
+        sys.exit(0)
+
+    with open(commit_msg_file) as f:
+        parse_result = subprocess.run(
+            ["git", "interpret-trailers", "--parse"],
+            stdin=f, capture_output=True, text=True
+        )
+    if parse_result.returncode != 0:
+        sys.exit(0)
+
+    existing_coauthors = [
+        line.strip()
+        for line in parse_result.stdout.splitlines()
+        if line.lower().startswith("co-authored-by:")
+    ]
+
+    trailers = []
+    for tool in tools:
+        config = COAUTHORS.get(tool)
+        if not config:
+            continue
+        if not any(config["match"].lower() in line.lower() for line in existing_coauthors):
+            trailers += ["--trailer", f"Co-authored-by: {config['value']}"]
+
+    if not trailers:
+        sys.exit(0)
+
+    try:
+        subprocess.run(
+            ["git", "interpret-trailers", "--in-place"] + trailers + [commit_msg_file],
+            check=True
+        )
+    except subprocess.CalledProcessError:
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # An attribution hook must never block a commit.
+        sys.exit(0)

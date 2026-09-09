@@ -18,6 +18,11 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
+      - name: Remove ML-DSA Dependency
+        # paragonie/pqcrypto_compat requires PHP 8.1 or later. The ML-DSA tests skip
+        # themselves when it is absent, so this job also covers that path.
+        if: matrix.php == '8.0'
+        run: composer remove --dev --no-update paragonie/pqcrypto_compat
       - name: Install Dependencies
         uses: nick-invision/retry@v1
         with:

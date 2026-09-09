@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+dir="$(cd "$(dirname "$0")" && pwd)/post-commit.d"
+[[ -d "$dir" ]] || exit 0
+for f in "$dir"/*; do
+    [[ -x "$f" ]] || continue
+    "$f" "$@"
+done

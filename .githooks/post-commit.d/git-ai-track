@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# okta-ai-attribution v0.0.1
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)" || exit 0
+STATE_FILE="$GIT_DIR/git-ai-working-state.json"
+if [ -f "$STATE_FILE" ]; then
+    rm -f "$STATE_FILE"
+fi
+exit 0
